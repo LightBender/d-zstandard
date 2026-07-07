@@ -1,6 +1,68 @@
-name "zstd-build"
-description "Build the appropriate zstd libraries for your system."
+name "d-zstd"
+description "D bindings for the ZStandard C Library."
 authors "EllipticBit LLC"
-copyright "Copyright © 2024-2025, EllipticBit LLC"
+copyright "Copyright © 2024-2026, EllipticBit LLC"
 license "BSL-1.0"
-targetType "executable"
+targetType "sourceLibrary"
+
+sourcePaths "source"
+importPaths "source"
+
+// Build (or refresh) the native zstd static library before anything else.
+// The orchestrator is a single cross-platform D script; it detects the target
+// OS/architecture, amalgamates the vendored zstd sources, and builds a static
+// library into lib/<os>-<arch>/. It is a no-op when the library is up to date.
+preGenerateCommands "rdmd -I. buildscripts/build_zstd.d"
+
+// Link the platform/architecture-specific object file produced above. A single
+// object is used (rather than an archive) so that every zstd function — including
+// internal-linkage helpers — is included at link time.
+sourceFiles "lib/windows-x86_64/zstd-build.obj" platform="windows-x86_64"
+sourceFiles "lib/windows-x86/zstd-build.obj" platform="windows-x86"
+sourceFiles "lib/windows-aarch64/zstd-build.obj" platform="windows-aarch64"
+sourceFiles "lib/linux-x86_64/zstd-build.o" platform="linux-x86_64"
+sourceFiles "lib/linux-x86/zstd-build.o" platform="linux-x86"
+sourceFiles "lib/linux-aarch64/zstd-build.o" platform="linux-aarch64"
+sourceFiles "lib/osx-x86_64/zstd-build.o" platform="osx-x86_64"
+sourceFiles "lib/osx-aarch64/zstd-build.o" platform="osx-aarch64"
+sourceFiles "lib/freebsd-x86_64/zstd-build.o" platform="freebsd-x86_64"
+sourceFiles "lib/freebsd-x86/zstd-build.o" platform="freebsd-x86"
+sourceFiles "lib/freebsd-aarch64/zstd-build.o" platform="freebsd-aarch64"
+
+// The amalgamated zstd is multithreaded, which needs the system thread library
+// when linking on POSIX platforms. Windows uses the Win32 threading API.
+libs "pthread" platform="posix"
+
+// Runnable examples (see the examples/ directory). Each depends on this package,
+// so building an example also builds and links the native zstd object.
+subPackage {
+	name "simple"
+	targetType "executable"
+	sourcePaths "examples/simple"
+	importPaths "examples/simple"
+	dependency "d-zstd" version="*"
+}
+
+subPackage {
+	name "streaming"
+	targetType "executable"
+	sourcePaths "examples/streaming"
+	importPaths "examples/streaming"
+	dependency "d-zstd" version="*"
+}
+
+subPackage {
+	name "dictionary"
+	targetType "executable"
+	sourcePaths "examples/dictionary"
+	importPaths "examples/dictionary"
+	dependency "d-zstd" version="*"
+}
+
+subPackage {
+	name "raw-c"
+	targetType "executable"
+	sourcePaths "examples/raw_c"
+	importPaths "examples/raw_c"
+	dependency "d-zstd" version="*"
+}

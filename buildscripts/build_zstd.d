@@ -41,9 +41,10 @@ void log(Args...)(Args args)
 int main()
 {
     const root = getcwd();
-    if (!exists(buildPath(root, "dub.sdl")))
+    // DUB may rewrite dub.sdl as dub.json when the package is used as a dependency.
+    if (!exists(buildPath(root, "dub.sdl")) && !exists(buildPath(root, "dub.json")))
     {
-        log("error: must be run from the package root (dub.sdl not found in ", root, ")");
+        log("error: must be run from the package root (neither dub.sdl nor dub.json found in ", root, ")");
         return 1;
     }
 

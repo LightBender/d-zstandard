@@ -115,49 +115,209 @@ int main()
     return 1;
 }
 
-/// Ensures the vendored `zstd` git submodule is present and usable.
+// Upstream zstd pin used when the package is not a full git checkout
+// (e.g. DUB registry / dependency installs, which have no .git metadata).
+enum zstdGitUrl = "https://github.com/facebook/zstd.git";
+enum zstdPinnedCommit = "f8745da6ff1ad1e7bab384bd1f9d742439278e99"; // v1.5.7
+
+/// Ensures the vendored `zstd` sources are present and usable.
 ///
-/// If `zstd/lib/zstd.h` is missing, runs `git submodule update --init zstd`
-/// from the package root. Returns `true` when the submodule is ready.
+/// Order of attempts when `zstd/lib/zstd.h` is missing:
+/// $(OL
+///   $(LI `git submodule update --init zstd`, if the package root is a git repo.)
+///   $(LI Clone `zstdGitUrl` and check out the pinned commit — required for DUB
+///        dependency installs, which are not git repositories.)
+/// )
+/// Returns `true` when the sources are ready.
 bool ensureZstdSubmodule(string root, string zstdDir)
 {
     const header = buildPath(zstdDir, "lib", "zstd.h");
     if (exists(header))
         return true;
 
-    log("zstd submodule not initialized; running git submodule update --init zstd");
+    log("zstd sources not found; attempting to fetch...");
 
-    if (!exists(buildPath(root, ".gitmodules")))
+    if (findInPath("git") is null)
     {
-        log("error: .gitmodules not found; cannot initialize the zstd submodule.");
+        log("error: git is not on PATH; cannot fetch the zstd sources.");
+        log("       install git, then re-run the build, or manually place zstd at:");
+        log("         ", zstdDir);
         return false;
     }
 
-    auto r = tryRun(["git", "-C", root, "submodule", "update", "--init", "zstd"]);
-    if (!r.ran)
+    // Prefer submodule init for real repository checkouts.
+    if (isGitRepo(root))
     {
-        log("error: failed to run git. Ensure git is installed and on PATH.");
-        log("       then run: git submodule update --init zstd");
-        return false;
-    }
-    if (r.status != 0)
-    {
+        log("running git submodule update --init zstd");
+        auto r = tryRun(["git", "-C", root, "submodule", "update", "--init", "zstd"]);
+        if (r.ran && r.status == 0 && exists(header))
+        {
+            log("zstd submodule initialized.");
+            return true;
+        }
         if (r.output.length)
             log(r.output);
-        log("error: git submodule update --init zstd failed (exit ", r.status, ").");
-        log("       run manually: git submodule update --init zstd");
-        return false;
+        log("submodule update failed or incomplete; falling back to clone");
     }
+    else
+    {
+        // DUB dependency installs are plain trees without .git.
+        log("package root is not a git repository (common for DUB dependencies)");
+    }
+
+    if (!cloneZstdSources(zstdDir, resolveZstdUrl(root), resolveZstdCommit(root)))
+        return false;
 
     if (!exists(header))
     {
-        log("error: zstd submodule still missing after init (expected ", header, ").");
-        log("       run manually: git submodule update --init zstd");
+        log("error: zstd sources still missing after fetch (expected ", header, ").");
         return false;
     }
 
-    log("zstd submodule initialized.");
+    log("zstd sources ready.");
     return true;
+}
+
+/// True when `dir` is inside a git working tree.
+bool isGitRepo(string dir)
+{
+    auto r = tryRun(["git", "-C", dir, "rev-parse", "--is-inside-work-tree"]);
+    return r.ran && r.status == 0 && r.output.strip == "true";
+}
+
+/// Resolves the zstd remote URL from `.gitmodules` when present.
+string resolveZstdUrl(string root)
+{
+    const gm = buildPath(root, ".gitmodules");
+    if (exists(gm))
+    {
+        foreach (line; readText(gm).splitLines)
+        {
+            auto t = line.strip;
+            if (t.startsWith("url"))
+            {
+                auto parts = t.split("=");
+                if (parts.length >= 2)
+                {
+                    const url = parts[1 .. $].join("=").strip;
+                    if (url.length)
+                        return url;
+                }
+            }
+        }
+    }
+    return zstdGitUrl;
+}
+
+/// Resolves the pinned zstd commit: gitlink SHA from the parent repo if
+/// available, otherwise the hard-coded pin matching the submodule.
+string resolveZstdCommit(string root)
+{
+    if (isGitRepo(root))
+    {
+        // `git ls-tree HEAD zstd` → "160000 commit <sha>\tzstd"
+        auto r = tryRun(["git", "-C", root, "ls-tree", "HEAD", "zstd"]);
+        if (r.ran && r.status == 0)
+        {
+            auto fields = r.output.strip.split();
+            if (fields.length >= 3 && fields[0] == "160000")
+                return fields[2];
+        }
+    }
+    return zstdPinnedCommit;
+}
+
+/// Clones zstd into `zstdDir` at `commit`. Uses a temporary directory so a
+/// failed fetch never leaves a half-populated tree in place.
+bool cloneZstdSources(string zstdDir, string url, string commit)
+{
+    const tmpDir = zstdDir ~ ".fetch-tmp";
+    silentRemoveTree(tmpDir);
+
+    log("cloning ", url, " @ ", commit);
+
+    // Shallow fetch of the exact commit (works without a full history).
+    mkdirRecurse(tmpDir);
+    auto init = tryRun(["git", "-C", tmpDir, "init"]);
+    if (!init.ran || init.status != 0)
+    {
+        logGitFailure("git init", init);
+        silentRemoveTree(tmpDir);
+        return false;
+    }
+
+    auto remote = tryRun(["git", "-C", tmpDir, "remote", "add", "origin", url]);
+    if (!remote.ran || remote.status != 0)
+    {
+        logGitFailure("git remote add", remote);
+        silentRemoveTree(tmpDir);
+        return false;
+    }
+
+    auto fetch = tryRun(["git", "-C", tmpDir, "fetch", "--depth", "1", "origin", commit]);
+    if (!fetch.ran || fetch.status != 0)
+    {
+        // Some hosts/git versions reject shallow fetches of arbitrary SHAs.
+        if (fetch.output.length)
+            log(fetch.output);
+        log("shallow fetch failed; retrying full fetch of ", commit);
+        fetch = tryRun(["git", "-C", tmpDir, "fetch", "origin", commit]);
+    }
+    if (!fetch.ran || fetch.status != 0)
+    {
+        logGitFailure("git fetch", fetch);
+        silentRemoveTree(tmpDir);
+        return false;
+    }
+
+    auto checkout = tryRun(["git", "-C", tmpDir, "checkout", "--force", "FETCH_HEAD"]);
+    if (!checkout.ran || checkout.status != 0)
+    {
+        logGitFailure("git checkout", checkout);
+        silentRemoveTree(tmpDir);
+        return false;
+    }
+
+    // Replace any incomplete placeholder directory left by an uninited submodule.
+    silentRemoveTree(zstdDir);
+    try
+    {
+        rename(tmpDir, zstdDir);
+    }
+    catch (Exception e)
+    {
+        log("error: failed to move fetched zstd into place: ", e.msg);
+        silentRemoveTree(tmpDir);
+        return false;
+    }
+    return true;
+}
+
+void logGitFailure(string step, ProcessResult r)
+{
+    if (r.output.length)
+        log(r.output);
+    if (!r.ran)
+        log("error: failed to run git during ", step, ". Ensure git is installed and on PATH.");
+    else
+        log("error: ", step, " failed (exit ", r.status, ").");
+}
+
+/// Removes a file or directory tree if present, ignoring errors.
+void silentRemoveTree(string path) nothrow
+{
+    try
+    {
+        if (!exists(path))
+            return;
+        if (isDir(path))
+            rmdirRecurse(path);
+        else
+            remove(path);
+    }
+    catch (Exception)
+    {
+    }
 }
 
 string detectOS()

@@ -3,6 +3,7 @@
  *
  * Run by dub as a pre-generate step (see dub.sdl). Responsibilities:
  * $(UL
+ *   $(LI Ensure the vendored zstd git submodule is initialized.)
  *   $(LI Detect the target OS/architecture (honouring dub's `$DUB_ARCH`).)
  *   $(LI Compute a build stamp from the zstd submodule commit, the build
  *        scripts, and the compiler, and skip rebuilding when it is unchanged.)
@@ -47,13 +48,10 @@ int main()
     }
 
     const zstdDir = buildPath(root, "zstd");
-    const zstdLib = buildPath(zstdDir, "lib");
-    if (!exists(buildPath(zstdLib, "zstd.h")))
-    {
-        log("error: zstd submodule not found. Run: git submodule update --init");
+    if (!ensureZstdSubmodule(root, zstdDir))
         return 1;
-    }
 
+    const zstdLib = buildPath(zstdDir, "lib");
     const os = detectOS();
     const arch = detectArch();
     const osArch = os ~ "-" ~ arch;
@@ -114,6 +112,51 @@ int main()
     else
         log("       ensure a D compiler with ImportC support, or a C compiler (cc/gcc/clang), is available.");
     return 1;
+}
+
+/// Ensures the vendored `zstd` git submodule is present and usable.
+///
+/// If `zstd/lib/zstd.h` is missing, runs `git submodule update --init zstd`
+/// from the package root. Returns `true` when the submodule is ready.
+bool ensureZstdSubmodule(string root, string zstdDir)
+{
+    const header = buildPath(zstdDir, "lib", "zstd.h");
+    if (exists(header))
+        return true;
+
+    log("zstd submodule not initialized; running git submodule update --init zstd");
+
+    if (!exists(buildPath(root, ".gitmodules")))
+    {
+        log("error: .gitmodules not found; cannot initialize the zstd submodule.");
+        return false;
+    }
+
+    auto r = tryRun(["git", "-C", root, "submodule", "update", "--init", "zstd"]);
+    if (!r.ran)
+    {
+        log("error: failed to run git. Ensure git is installed and on PATH.");
+        log("       then run: git submodule update --init zstd");
+        return false;
+    }
+    if (r.status != 0)
+    {
+        if (r.output.length)
+            log(r.output);
+        log("error: git submodule update --init zstd failed (exit ", r.status, ").");
+        log("       run manually: git submodule update --init zstd");
+        return false;
+    }
+
+    if (!exists(header))
+    {
+        log("error: zstd submodule still missing after init (expected ", header, ").");
+        log("       run manually: git submodule update --init zstd");
+        return false;
+    }
+
+    log("zstd submodule initialized.");
+    return true;
 }
 
 string detectOS()

@@ -8,8 +8,9 @@
  *   $(LI Compute a build stamp from the zstd submodule commit, the build
  *        scripts, and the compiler, and skip rebuilding when it is unchanged.)
  *   $(LI Amalgamate the zstd sources into a single C file (via `combine.d`).)
- *   $(LI Build a static library, preferring the D compiler's ImportC, and
- *        falling back to the native C toolchain when ImportC cannot compile it.)
+ *   $(LI Build a static library: on Windows prefer MSVC (ImportC cannot resolve
+ *        MSVC/Windows SDK intrinsics), otherwise prefer ImportC and fall back
+ *        to the native C toolchain.)
  * )
  *
  * The resulting library is written to `lib/<os>-<arch>/` and consumed by dub.
@@ -88,28 +89,51 @@ int main()
     opt.output = amalgamFile;
     amalgamate(opt);
 
-    // 2. Try the primary path: the D compiler's ImportC. DMD's `-c` can succeed
-    //    while leaving unresolved intrinsics, so the object is verified by a test
-    //    link before we accept it.
-    if (buildWithImportC(amalgamFile, objPath, arch, isWindows) && verifyObject(objPath, arch, isWindows))
+    // 2. Compile the amalgamation. On Windows, MSVC is preferred: ImportC uses
+    //    the MSVC preprocessor/headers and emits unresolved MSVC/Windows SDK
+    //    intrinsics. Elsewhere ImportC is tried first, then the native C toolchain.
+    //    Every candidate object is verified with a test link before acceptance.
+    if (isWindows)
     {
-        std.file.write(stampPath, stamp);
-        log("built via ImportC: ", objPath.relativePath(root));
-        return 0;
+        log("Windows target: preferring MSVC for the native zstd object");
+        if (buildWithNativeCC(amalgamFile, objPath, arch, isWindows)
+                && verifyObject(objPath, arch, isWindows))
+        {
+            std.file.write(stampPath, stamp);
+            log("built via native C toolchain: ", objPath.relativePath(root));
+            return 0;
+        }
+        log("MSVC path unavailable/failed; trying ImportC with a portable shim...");
+        if (buildWithImportC(amalgamFile, objPath, arch, isWindows)
+                && verifyObject(objPath, arch, isWindows))
+        {
+            std.file.write(stampPath, stamp);
+            log("built via ImportC: ", objPath.relativePath(root));
+            return 0;
+        }
     }
-    log("ImportC path unavailable/failed; trying the native C toolchain...");
-
-    // 3. Fall back to the native C toolchain, also verified.
-    if (buildWithNativeCC(amalgamFile, objPath, arch, isWindows) && verifyObject(objPath, arch, isWindows))
+    else
     {
-        std.file.write(stampPath, stamp);
-        log("built via native C toolchain: ", objPath.relativePath(root));
-        return 0;
+        if (buildWithImportC(amalgamFile, objPath, arch, isWindows)
+                && verifyObject(objPath, arch, isWindows))
+        {
+            std.file.write(stampPath, stamp);
+            log("built via ImportC: ", objPath.relativePath(root));
+            return 0;
+        }
+        log("ImportC path unavailable/failed; trying the native C toolchain...");
+        if (buildWithNativeCC(amalgamFile, objPath, arch, isWindows)
+                && verifyObject(objPath, arch, isWindows))
+        {
+            std.file.write(stampPath, stamp);
+            log("built via native C toolchain: ", objPath.relativePath(root));
+            return 0;
+        }
     }
 
     log("error: failed to build the zstd object for ", osArch, ".");
     if (isWindows)
-        log("       ensure a D compiler with ImportC support, or the MSVC 'cl' compiler, is available.");
+        log("       ensure the MSVC 'cl' compiler (Visual Studio C++ tools) is available.");
     else
         log("       ensure a D compiler with ImportC support, or a C compiler (cc/gcc/clang), is available.");
     return 1;
@@ -424,14 +448,17 @@ string firstLine(string s)
 /// Builds the static library using the D compiler's ImportC support.
 ///
 /// DMD's ImportC uses the platform C preprocessor but its own C compiler, which
-/// does not implement every MSVC/GCC compiler intrinsic. We therefore compile a
-/// tiny shim translation unit that neutralises the intrinsics zstd relies on and
-/// then includes the amalgamation.
+/// does not implement MSVC/Windows SDK intrinsics. The shim forces portable C
+/// paths (no SIMD, no MSVC bitops, no Windows threading headers) so the object
+/// can link with the D toolchain.
 bool buildWithImportC(string amalgamFile, string objPath, string arch, bool isWindows)
 {
     const dc = environment.get("DMD", "dmd");
     const shimFile = buildPath(dirName(amalgamFile), "zstd_importc.c");
-    std.file.write(shimFile, importCShimPrefix() ~ cast(string) read(amalgamFile));
+    std.file.write(shimFile, importCShimPrefix(isWindows) ~ cast(string) read(amalgamFile));
+
+    // Drop any previous failed object so a partial ImportC result cannot linger.
+    silentRemove(objPath);
 
     auto cmd = [
         dc, "-c", archModelFlag(arch), "-of=" ~ objPath, shimFile,
@@ -443,22 +470,49 @@ bool buildWithImportC(string amalgamFile, string objPath, string arch, bool isWi
     if (r.status != 0)
     {
         log(r.output);
+        silentRemove(objPath);
         return false;
     }
     return exists(objPath);
 }
 
-/// Preprocessor prefix prepended to the amalgamation for the ImportC build:
-/// neutralise intrinsics and inline hints DMD's ImportC does not implement, so
-/// every helper is emitted as a real function.
-string importCShimPrefix()
+/// Preprocessor prefix prepended to the amalgamation for the ImportC build.
+///
+/// On Windows, ImportC still sees MSVC headers (`_MSC_VER`, `windows.h`,
+/// `intrin.h`) and would otherwise emit unresolved MSVC/SDK symbols. The shim
+/// forces zstd's portable C fallbacks and disables the multithreaded path that
+/// pulls in `windows.h`.
+string importCShimPrefix(bool isWindows)
 {
-    return `/* Auto-generated by build_zstd.d. Neutralises compiler intrinsics and
- * inline hints that DMD's ImportC does not fully implement. */
-#define __assume(x) ((void)0)
-#define __inline
-#define __forceinline
-`;
+    // Use explicit ~ concatenation (DMD 2.113+ rejects adjacent string literals).
+    // Avoid nested WYSIWYG strings so later backtick literals remain valid.
+    string s =
+        "/* Auto-generated by build_zstd.d for ImportC.\n" ~
+        " * Force portable C: no MSVC/SIMD intrinsics that ImportC cannot lower. */\n" ~
+        "#define __assume(x) ((void)0)\n" ~
+        "#define __inline\n" ~
+        "#define __forceinline\n" ~
+        "#define ZSTD_NO_INTRINSICS 1\n" ~
+        "#define NO_PREFETCH 1\n" ~
+        "#define ZSTD_DISABLE_ASM 1\n" ~
+        "#define DYNAMIC_BMI2 0\n" ~
+        "#define STATIC_BMI2 0\n";
+    if (isWindows)
+    {
+        // Undefine MSVC identity so bits.h/cpu.h take portable branches, and
+        // drop multithreading so windows.h is not included under ImportC.
+        s ~=
+            "#ifdef _MSC_VER\n" ~
+            "#undef _MSC_VER\n" ~
+            "#endif\n" ~
+            "#ifdef _MSC_FULL_VER\n" ~
+            "#undef _MSC_FULL_VER\n" ~
+            "#endif\n" ~
+            "#ifdef ZSTD_MULTITHREAD\n" ~
+            "#undef ZSTD_MULTITHREAD\n" ~
+            "#endif\n";
+    }
+    return s;
 }
 
 /// Builds the object file using the native C toolchain.
@@ -480,12 +534,15 @@ bool buildWithMSVC(string amalgamFile, string objPath)
     }
     const vcArch = arch == "x86" ? "x86" : (arch == "aarch64" ? "x64_arm64" : "x64");
 
+    silentRemove(objPath);
+
     // Run vcvarsall (to populate INCLUDE/LIB/PATH) and cl in one cmd session.
     const batPath = buildPath(dirName(objPath), "zstd_cl_build.bat");
     std.file.write(batPath,
             "@echo off\r\n"
-            ~ `call "` ~ vcvars ~ `" ` ~ vcArch ~ "\r\n"
-            ~ `cl /nologo /c /O2 /Fo"` ~ objPath ~ `" "` ~ amalgamFile ~ `"` ~ "\r\n"
+            ~ "call \"" ~ vcvars ~ "\" " ~ vcArch ~ "\r\n"
+            ~ "if errorlevel 1 exit /b %ERRORLEVEL%\r\n"
+            ~ "cl /nologo /c /O2 /DZSTD_DISABLE_ASM=1 /Fo\"" ~ objPath ~ "\" \"" ~ amalgamFile ~ "\"\r\n"
             ~ "exit /b %ERRORLEVEL%\r\n");
     scope (exit)
         silentRemove(batPath);
@@ -494,7 +551,9 @@ bool buildWithMSVC(string amalgamFile, string objPath)
     auto r = tryRun(["cmd", "/c", batPath]);
     if (!r.ran || r.status != 0)
     {
-        log(r.output);
+        if (r.output.length)
+            log(r.output);
+        silentRemove(objPath);
         return false;
     }
     return exists(objPath);
@@ -572,6 +631,8 @@ bool buildWithPosixCC(string amalgamFile, string objPath, string arch)
         return false;
     }
 
+    silentRemove(objPath);
+
     auto compile = [
         cc, archModelFlag(arch), "-O2", "-fPIC", "-DZSTD_DISABLE_ASM=1",
         "-c", amalgamFile, "-o", objPath,
@@ -581,6 +642,7 @@ bool buildWithPosixCC(string amalgamFile, string objPath, string arch)
     if (!c.ran || c.status != 0)
     {
         log(c.output);
+        silentRemove(objPath);
         return false;
     }
     return exists(objPath);
@@ -642,3 +704,4 @@ string findInPath(string exe)
     }
     return null;
 }
+
